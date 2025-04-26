@@ -5,12 +5,11 @@ from amaranth import *
 from amaranth.lib import io
 from amaranth.lib.cdc import FFSynchronizer
 
-from ....gateware.analyzer import *
 from ... import *
 
 """
 GPIB / IEEE-488 is a 16 line bus, with a single controller (in this case, the
-controller will be the Glasgow. The bus can be in one of two modes, depending
+controller will be the Glasgow). The bus can be in one of two modes, depending
 on the ATN line (active low). When ATN is low, all other devices on the bus
 must listen to the controller. When high, only the addressed device needs to
 listen.
@@ -28,8 +27,8 @@ the bus management lines (x5) and the handshake lines (x3).
            Any device on the bus can use this to signal the end of binary data, or
            to delimit textual data.
   IFC    - Interface Clear
-           Allows the controller (us) to instruct all devices on the bus to reset
-           their bus function to the initial state.
+           Allows the controller to instruct all devices on the bus to reset their
+           bus function to the initial state.
   SRQ    - Service Request
            All devices, aside from the controller, can use this line to indicate to
            the controller that something has finished, or that an error has occured.
@@ -76,11 +75,11 @@ class GPIBBus(Elaboratable):
     def elaborate(self, platform):
         m = Module()
 
-        m.submodules.dio_buffer  = dio_buffer  = io.FFBuffer("io", self.ports.dio)
-        m.submodules.dav_buffer  = dav_buffer  = io.FFBuffer("io", self.ports.dav)
-        m.submodules.eoi_buffer  = eoi_buffer  = io.FFBuffer("io", self.ports.eoi)
-        m.submodules.nrfd_buffer = nrfd_buffer = io.FFBuffer("io", self.ports.nrfd)
-        m.submodules.ndac_buffer = ndac_buffer = io.FFBuffer("io", self.ports.ndac)
+        m.submodules.dio_buffer  = dio_buffer  = io.Buffer("io", self.ports.dio)
+        m.submodules.dav_buffer  = dav_buffer  = io.Buffer("io", self.ports.dav)
+        m.submodules.eoi_buffer  = eoi_buffer  = io.Buffer("io", self.ports.eoi)
+        m.submodules.nrfd_buffer = nrfd_buffer = io.Buffer("io", self.ports.nrfd)
+        m.submodules.ndac_buffer = ndac_buffer = io.Buffer("io", self.ports.ndac)
 
         m.submodules.ifc_buffer  = ifc_buffer  = io.Buffer("o", self.ports.ifc)
         m.submodules.atn_buffer  = atn_buffer  = io.Buffer("o", self.ports.atn)
@@ -92,6 +91,14 @@ class GPIBBus(Elaboratable):
             atn_buffer.o.eq(self.atn),
             ren_buffer.o.eq(self.ren),
             self.srq.eq(srq_buffer.i),
+        ]
+
+        m.d.sync += [
+            dio_buffer.oe.eq(self.activity),
+            eoi_buffer.oe.eq(self.activity),
+            dav_buffer.oe.eq(self.activity),
+            nrfd_buffer.oe.eq(~self.activity),
+            ndac_buffer.oe.eq(~self.activity),
         ]
 
         # Talk
@@ -132,7 +139,7 @@ class GPIB(Elaboratable):
 
         # If there's data waiting to be sent
         # Feel like I need a separate flag for this, so we can still send null characters....
-        with m.If(self.tx_data.i):
+        with m.If(self.tx_data):
             m.d.sync += self.bus.activity.eq(1)
 
             with m.FSM():
@@ -232,20 +239,9 @@ class GPIBSubtarget(Elaboratable):
     def elaborate(self, platform):
         m = Module()
 
-
-        m.d.sync +=
+        m.submodules += gpib = self.gpib
 
         return m
-
-
-class GPIBInterface:
-    def __init__(self, interface, event_sources):
-        self.lower   = interface
-        self.decoder = TraceDecoder(event_sources)
-
-    async def read(self):
-        self.decoder.process(await self.lower.read())
-        return self.decoder.flush()
 
 
 class GPIBApplet(GlasgowApplet):
@@ -260,92 +256,51 @@ class GPIBApplet(GlasgowApplet):
     def add_build_arguments(cls, parser, access):
         super().add_build_arguments(parser, access)
 
-        access.add_pin_set_argument(parser, "i", width=range(1, 17), default=1)
-        parser.add_argument(
-            "--pin-names", metavar="NAMES", default=None,
-            help="optional comma separated list of pin names")
+        access.add_pin_set_argument(parser, "dio", width=range(1, 8), default=(0,1,2,3,4,5,6,7))
+        access.add_pin_argument(parser, "eoi",  default=8)
+        access.add_pin_argument(parser, "dav",  default=9)
+        access.add_pin_argument(parser, "nrfd", default=10)
+        access.add_pin_argument(parser, "ndac", default=11)
+        access.add_pin_argument(parser, "ifc",  default=12)
+        access.add_pin_argument(parser, "srq",  default=13)
+        access.add_pin_argument(parser, "atn",  default=14)
+        access.add_pin_argument(parser, "ren",  default=15)
 
     def build(self, target, args):
         self.mux_interface = iface = target.multiplexer.claim_interface(self, args)
-        subtarget = iface.add_subtarget(AnalyzerSubtarget(
-            ports=iface.get_port_group(i = args.pin_set_i),
+        subtarget = iface.add_subtarget(GPIBSubtarget(
+            ports=iface.get_port_group(
+                dio  = args.pin_set_dio,
+                eoi  = args.pin_eoi,
+                dav  = args.pin_dav,
+                nrfd = args.pin_nrfd,
+                ndac = args.pin_ndac,
+                ifc  = args.pin_ifc,
+                srq  = args.pin_srq,
+                atn  = args.pin_atn,
+                ren  = args.pin_ren
+            ),
             in_fifo=iface.get_in_fifo(),
-            trigger_pattern=args.trigger,
+            out_fifo=iface.get_out_fifo()
         ))
 
         self._sample_freq = target.sys_clk_freq
-        self._event_sources = subtarget.analyzer.event_sources
 
     @classmethod
     def add_run_arguments(cls, parser, access):
         super().add_run_arguments(parser, access)
 
-        g_pulls = parser.add_mutually_exclusive_group()
-        g_pulls.add_argument(
-            "--pull-ups", default=False, action="store_true",
-            help="enable pull-ups on all pins")
-        g_pulls.add_argument(
-            "--pull-downs", default=False, action="store_true",
-            help="enable pull-downs on all pins")
-
     async def run(self, device, args):
-        pull_low  = set()
-        pull_high = set()
-        if args.pull_ups:
-            pull_high = set(args.pin_set_i)
-        if args.pull_downs:
-            pull_low = set(args.pin_set_i)
         iface = await device.demultiplexer.claim_interface(self, self.mux_interface, args,
                                                            pull_low=pull_low, pull_high=pull_high)
-        return AnalyzerInterface(iface, self._event_sources)
+        return GPIBInterface(iface, self._event_sources)
 
     @classmethod
     def add_interact_arguments(cls, parser):
-        parser.add_argument(
-            "file", metavar="VCD-FILE", type=argparse.FileType("w"),
-            help="write VCD waveforms to VCD-FILE")
+        pass
 
     async def interact(self, device, args, iface):
-        vcd_writer = VCDWriter(args.file, timescale="1 ns", check_values=False)
-        signals = []
-
-        names = []
-        if args.pin_names:
-            names = args.pin_names.split(",")
-            assert len(names) == self._event_sources[0].width
-        else:
-            names = [ f"pin[{index}]" for index in range(self._event_sources[0].width) ]
-
-        for index in range(self._event_sources[0].width):
-            signals.append(vcd_writer.register_var(scope="glasgow", name=names[index],
-                var_type="wire", size=1, init=0))
-
-        try:
-            overrun = False
-            timestamp = 0
-            trigger_offset = 0
-            while not overrun:
-                for cycle, events in await iface.read():
-                    timestamp = cycle * 1_000_000_000 // self._sample_freq
-
-                    if events == "overrun":
-                        self.logger.error("FIFO overrun, shutting down")
-                        for signal in signals:
-                            vcd_writer.change(signal, timestamp - trigger_offset, "x")
-                        overrun = True
-                        break
-
-                    if "triggered" in events:
-                        trigger_offset = timestamp
-                        self.logger.info(f"Triggered after {int(timestamp/1e3)}us")
-
-                    if "pin" in events: # could be also "throttle"
-                        value = events["pin"]
-                        for bit, signal in enumerate(signals):
-                            vcd_writer.change(signal, timestamp - trigger_offset, (value >> bit) & 1)
-
-        finally:
-            vcd_writer.close(timestamp)
+        pass
 
     @classmethod
     def tests(cls):
