@@ -1,6 +1,7 @@
 import logging
 import argparse
 import math
+import asyncio
 from amaranth import *
 from amaranth.lib import io
 from amaranth.lib.cdc import FFSynchronizer
@@ -8,265 +9,141 @@ from amaranth.lib.cdc import FFSynchronizer
 from ... import *
 
 """
-GPIB / IEEE-488 is a 16 line bus, with a single controller (in this case, the
-controller will be the Glasgow). The bus can be in one of two modes, depending
-on the ATN line (active low). When ATN is low, all other devices on the bus
-must listen to the controller. When high, only the addressed device needs to
-listen.
+This applet acts as a GPIB listener, allowing it to receive data from
+GPIB devices where no addressing is used. For example, a TDS
+oscilloscope has a "talk only" more - when configured to use GPIB, it
+will write a screenshot over GPIB.
 
-The sixteen lines can be broken into three groups. These are the data lines (x8),
-the bus management lines (x5) and the handshake lines (x3).
+In this mode, only four control/handshaking lines are required, in
+addition to the 8 data lines.
 
-  *** DATA LINES  ***
-  DIOx   - There are eight data I/O lines.
-
-  *** BUS MANAGEMENT LINES ***
-  ATN    - Attention
-           This dictates whether we are in command or data mode.
-  EOI    - End-or-Identify
-           Any device on the bus can use this to signal the end of binary data, or
-           to delimit textual data.
-  IFC    - Interface Clear
-           Allows the controller to instruct all devices on the bus to reset their
-           bus function to the initial state.
-  SRQ    - Service Request
-           All devices, aside from the controller, can use this line to indicate to
-           the controller that something has finished, or that an error has occured.
-           When this line is pulled low by a device, the controller should poll to
-           find out which device is asking for service and what they want.
-  REN    - Remote Enable
-
-  *** HANDSHAKE LINES ***
-  DAV    - Data Valid
-           A device pulls this line high when it is sending data.
-  NRFD   - Not Ready for Data
-           A device pulls this line height when data hasn't been fully received yet.
-  NDAC   - Not Data Accepted
-           A device is not ready to receive data yet.
-
-Whether the ports are inputs or outputs is dictated by whether the device is
-listening or talking.
-
-+--------++------+-----+-----+------+------+--*--+--*--+--*--+--*--+
-| Action || DIOx | EOI | DAV | NRFD | NDAC | IFC | SRQ | ATN | REN |
-+--------++------+-----+-----+------+------+-----+-----+-----+-----+
-| Talk   || OUT  | OUT | OUT | IN   | IN   | OUT | IN  | OUT | OUT |
-| Listen || IN   | IN  | IN  | OUT  | OUT  | OUT | IN  | OUT | OUT |
-+--------++------+-----+-----+------+------+-----+-----+-----+-----+
 """
 
 class GPIBBus(Elaboratable):
     def __init__(self, ports):
         self.ports = ports
 
-        # High for Talk, Low for Listen
-        self.activity = Signal()
-
-        self.dio  = Signal(8)
-        self.eoi  = Signal() # End or Identify
-        self.dav  = Signal() # Data Valid
-        self.nrfd = Signal() # Not Ready For Data
-        self.ndac = Signal() # Not Data Accepted
-        self.ifc  = Signal() # Interface Clear
-        self.srq  = Signal() # Service Request
-        self.atn  = Signal() # Attention!
-        self.ren  = Signal() # Remote Enable
+        self.dio  = Signal(8) # Data Lines
+        self.eoi  = Signal()  # End or Identify
+        self.dav  = Signal()  # Data Valid
+        self.nrfd = Signal()  # Not Ready For Data
+        self.ndac = Signal()  # Not Data Accepted
 
     def elaborate(self, platform):
         m = Module()
 
-        m.submodules.dio_buffer  = dio_buffer  = io.Buffer("io", self.ports.dio)
-        m.submodules.dav_buffer  = dav_buffer  = io.Buffer("io", self.ports.dav)
-        m.submodules.eoi_buffer  = eoi_buffer  = io.Buffer("io", self.ports.eoi)
-        m.submodules.nrfd_buffer = nrfd_buffer = io.Buffer("io", self.ports.nrfd)
-        m.submodules.ndac_buffer = ndac_buffer = io.Buffer("io", self.ports.ndac)
+        m.submodules.dio_buffer  = dio_buffer  = io.Buffer("i", self.ports.dio)
+        m.submodules.dav_buffer  = dav_buffer  = io.Buffer("i", self.ports.dav)
+        m.submodules.eoi_buffer  = eoi_buffer  = io.Buffer("i", self.ports.eoi)
+        m.submodules.nrfd_buffer = nrfd_buffer = io.Buffer("o", self.ports.nrfd)
+        m.submodules.ndac_buffer = ndac_buffer = io.Buffer("o", self.ports.ndac)
 
-        m.submodules.ifc_buffer  = ifc_buffer  = io.Buffer("o", self.ports.ifc)
-        m.submodules.atn_buffer  = atn_buffer  = io.Buffer("o", self.ports.atn)
-        m.submodules.ren_buffer  = ren_buffer  = io.Buffer("o", self.ports.ren)
-        m.submodules.srq_buffer  = srq_buffer  = io.Buffer("i", self.ports.srq)
-
-        m.d.sync += [
-            ifc_buffer.o.eq(self.ifc),
-            atn_buffer.o.eq(self.atn),
-            ren_buffer.o.eq(self.ren),
-            self.srq.eq(srq_buffer.i),
+        m.d.comb += [
+            nrfd_buffer.oe.eq(1),
+            nrfd_buffer.o.eq(self.nrfd),
+            ndac_buffer.oe.eq(1),
+            ndac_buffer.o.eq(self.ndac),
+            self.dio.eq(dio_buffer.i),
+            self.eoi.eq(eoi_buffer.i),
+            self.dav.eq(dav_buffer.i),
         ]
-
-        m.d.sync += [
-            dio_buffer.oe.eq(self.activity),
-            eoi_buffer.oe.eq(self.activity),
-            dav_buffer.oe.eq(self.activity),
-            nrfd_buffer.oe.eq(~self.activity),
-            ndac_buffer.oe.eq(~self.activity),
-        ]
-
-        # Talk
-        with m.If(self.activity):
-            m.d.sync += [
-                dio_buffer.o.eq(self.dio),
-                eoi_buffer.o.eq(self.eoi),
-                dav_buffer.o.eq(self.dav),
-                self.nrfd.eq(nrfd_buffer.i),
-                self.ndac.eq(ndac_buffer.i),
-            ]
-
-        # Listen
-        with m.Else():
-            m.d.sync += [
-                self.dio.eq(dio_buffer.i),
-                self.eoi.eq(eoi_buffer.i),
-                self.dav.eq(dav_buffer.i),
-                nrfd_buffer.o.eq(self.nrfd),
-                ndac_buffer.o.eq(self.ndac),
-            ]
 
         return m
 
 class GPIB(Elaboratable):
-
-
     def __init__(self, ports):
         self.bus = GPIBBus(ports)
 
-        self.mode    = Signal(1) # Command (Low) or Data (High)
-        self.rx_data = Signal(8)
-        self.tx_data = Signal(8)
+        self.rx_data     = Signal(8)
+        self.rx_data_rdy = Signal(1)
+        self.rx_data_ack = Signal(1)
+
+        self.eoi         = Signal(1)
 
     def elaborate(self, platform):
-        delay_cycles = math.ceil(1e10 * platform.default_clk_frequency)
-        timer = Signal(range(delay_cycles))
+        m = Module()
 
-        # If there's data waiting to be sent
-        # Feel like I need a separate flag for this, so we can still send null characters....
-        with m.If(self.tx_data):
-            m.d.sync += self.bus.activity.eq(1)
+        m.submodules.bus = self.bus
 
-            with m.FSM():
-                with m.State("Idle"):
-                    with m.If(self.tx_data.i):
-                        m.next("Start")
+        m.d.sync += self.eoi.eq(self.bus.eoi)
 
-                with m.State("Start"):
-                    m.d.sync += self.bus.dav.eq(0)
-                    m.next("Check NRFD and NDAC are low")
+        with m.FSM():
+            with m.State("Idle"):
+                m.d.sync += [
+                    self.bus.ndac.eq(0),
+                    self.bus.nrfd.eq(1),
+                ]
+                with m.If(~self.bus.dav):
+                    m.next = "Read data"
 
-                with m.State("Check NRFD and NDAC are low"):
-                    # NRFD is active low, NDAC is active high
-                    with m.If(self.bus.nrfd & ~self.bus.ndac):
-                        m.next("Set mode")
-                    with m.Else():
-                        m.next("Error")
+            with m.State("Read data"):
+                m.d.sync += [
+                    self.rx_data.eq(~self.bus.dio),
+                    self.bus.ndac.eq(1),
+                    self.rx_data_rdy.eq(1),
+                ]
+                m.next = "Wait for acknowledgement"
 
-                with m.State("Set mode"):
-                    m.d.sync += self.bus.atn.eq(self.mode)
-                    m.next("Set DIO lines")
-
-                with m.State("Set DIO lines"):
+            with m.State("Wait for acknowledgement"):
+                with m.If(self.rx_data_ack):
                     m.d.sync += [
-                        self.bus.dio.eq(self.tx_data),
-                        m.d.sync += timer.eq(delay_cycles),
+                        self.rx_data_rdy.eq(0),
+                        self.bus.nrfd.eq(0),
+                        self.bus.ndac.eq(0),
                     ]
-                    m.next("Wait for lines to settle")
+                    m.next = "Wait for DAV Unasserted"
 
-                with m.State("Wait for lines to settle"):
-                    with m.If(timer == 0):
-                        m.next("Assert DAV")
-                    with m.Else():
-                        m.d.sync += timer.eq(timer - 1)
+            with m.State("Wait for DAV Unasserted"):
+                with m.If(self.bus.dav):
+                    m.next = "Idle"
 
-                with m.State("Assert DAV"):
-                    m.d.sync += self.bus.dav.eq(1)
-                    with m.If(~data.bus.ndac):
-                        m.State("Unassert DAV")
-
-                with m.State("Unassert DAV"):
-                    m.d.sync += [
-                        self.bus.dav.eq(0),
-                        self.bus.dio.eq(0),
-                    ]
-                    m.next("Idle")
-
-                with m.State("Error"):
-                    pass
-
-        with m.Else():
-            m.d.sync += self.bus.activity.eq(0) # Listen
-            with m.FSM():
-                with m.State("Idle"):
-                    # Tell the bus we're ready to receive
-                    m.d.sync += self.bus.nrfd.eq(0)
-                    m.d.sync += self.bus.ndac.eq(1)
-
-                    # with a timeout...
-                    m.d.sync += timer.eq(delay_cycles)
-
-                    m.next("Check DAV")
-
-                with m.State("Check DAV"):
-                    with m.If(timer == 0):
-                        m.d.sync += timer.eq(timer - 1)
-                    with m.Else():
-                        with m.If(self.bus.dav):
-                            m.next("Assert NRFD")
-
-                with m.State("Assert NRFD"):
-                    m.d.sync += self.bus.nrfd.eq(1)
-                    m.next("Read data")
-
-                with m.State("Read data"):
-                    # Do something with what's on DIOx
-                    m.next("Unassert NDAC")
-
-                with m.State("Unassert NDAC"):
-                    m.d.sync += self.bus.ndac.eq(0)
-                    m.next("Wait for DAV to be unasserted")
-
-                with m.State("Wait for DAV to be unasserted"):
-                    with m.If(~self.bus.dav):
-                        m.next("Idle")
-
+        return m
 
 class GPIBSubtarget(Elaboratable):
 
-    def __init__(self, ports, out_fifo, in_fifo):
+    def __init__(self, ports, in_fifo, eoi):
         self.ports    = ports
-        self.out_fifo = out_fifo
-        self.in_fifi  = in_fifo
+        self.in_fifo  = in_fifo
+        self.eoi      = eoi
 
         self.gpib = GPIB(ports)
 
     def elaborate(self, platform):
         m = Module()
 
-        m.submodules += gpib = self.gpib
+        m.submodules.gpib = gpib = self.gpib
+
+        m.d.comb += [
+            self.in_fifo.w_data.eq(gpib.rx_data),
+            self.in_fifo.w_en.eq(gpib.rx_data_rdy),
+            gpib.rx_data_ack.eq(self.in_fifo.w_rdy),
+            self.eoi.eq(gpib.eoi),
+        ]
 
         return m
 
 
 class GPIBApplet(GlasgowApplet):
     logger = logging.getLogger(__name__)
-    help = "talks to a gpib device"
+    help = "receive data from gpib"
     description = """
-    Talk to a GPIB device, e.g. for doing oscilloscope acquisitions
+    Receive 'talk only' data from equipment, not bidirectional.
     """
-    required_revision = "C0" # iCE40UP5K isn't quite fast enoughs
+    required_revision = "C0"
 
     @classmethod
     def add_build_arguments(cls, parser, access):
         super().add_build_arguments(parser, access)
 
-        access.add_pin_set_argument(parser, "dio", width=range(1, 8), default=(0,1,2,3,4,5,6,7))
-        access.add_pin_argument(parser, "eoi",  default=8)
-        access.add_pin_argument(parser, "dav",  default=9)
-        access.add_pin_argument(parser, "nrfd", default=10)
-        access.add_pin_argument(parser, "ndac", default=11)
-        access.add_pin_argument(parser, "ifc",  default=12)
-        access.add_pin_argument(parser, "srq",  default=13)
-        access.add_pin_argument(parser, "atn",  default=14)
-        access.add_pin_argument(parser, "ren",  default=15)
+        access.add_pin_set_argument(parser, "dio", width=range(1, 8), default=(0,1,2,3,15,14,13,12))
+        access.add_pin_argument(parser, "eoi",  default=4)
+        access.add_pin_argument(parser, "dav",  default=5)
+        access.add_pin_argument(parser, "nrfd", default=6)
+        access.add_pin_argument(parser, "ndac", default=7)
 
     def build(self, target, args):
+        eoi, self.__addr_eoi = target.registers.add_ro(1)
+
         self.mux_interface = iface = target.multiplexer.claim_interface(self, args)
         subtarget = iface.add_subtarget(GPIBSubtarget(
             ports=iface.get_port_group(
@@ -275,13 +152,9 @@ class GPIBApplet(GlasgowApplet):
                 dav  = args.pin_dav,
                 nrfd = args.pin_nrfd,
                 ndac = args.pin_ndac,
-                ifc  = args.pin_ifc,
-                srq  = args.pin_srq,
-                atn  = args.pin_atn,
-                ren  = args.pin_ren
             ),
             in_fifo=iface.get_in_fifo(),
-            out_fifo=iface.get_out_fifo()
+            eoi=eoi
         ))
 
         self._sample_freq = target.sys_clk_freq
@@ -291,18 +164,25 @@ class GPIBApplet(GlasgowApplet):
         super().add_run_arguments(parser, access)
 
     async def run(self, device, args):
+        pull_high = set(args.pin_set_dio).union({
+            args.pin_dav, args.pin_eoi
+        })
+
         iface = await device.demultiplexer.claim_interface(self, self.mux_interface, args,
-                                                           pull_low=pull_low, pull_high=pull_high)
-        return GPIBInterface(iface, self._event_sources)
+                                                           pull_high=pull_high)
+        return iface
 
     @classmethod
     def add_interact_arguments(cls, parser):
         pass
 
-    async def interact(self, device, args, iface):
-        pass
+    async def interact(self, device, args, gpib):
+        eoi = True
+        while eoi:
+            read_data = await gpib.read()
+            print(read_data.tobytes().decode('ascii'), end='')
+            eoi = await device.read_register(self.__addr_eoi)
 
     @classmethod
     def tests(cls):
-        from . import test
-        return test.AnalyzerAppletTestCase
+        pass
