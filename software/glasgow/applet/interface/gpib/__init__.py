@@ -150,9 +150,14 @@ class GPIB(Elaboratable):
         self.rx_data_rdy = Signal(1)
         self.rx_data_ack = Signal(1)
 
+        self.tx_data     = Signal(8)
+        self.tx_data_rdy = Signal(1)
+        self.tx_data_ack = Signal(1)
+
         self.direction   = Signal(1) # Talk = HIGH,  Listen = LOW
 
         self.eoi         = Signal(1)
+        self.atn         = Signal(1)
 
     def elaborate(self, platform):
         m = Module()
@@ -163,9 +168,11 @@ class GPIB(Elaboratable):
         # EOI       - Allows the interact know when it should stop reading
         # Direction - Determines whether we are listening or talking.
         #             The state of pull up resistors is handled by interact.
+        # ATN       - When active, puts the GPIB into Command mode.
         m.d.sync += [
             self.eoi.eq(self.bus.eoi_i),
             self.bus.direction.eq(self.direction),
+            self.bus.atn_o.eq(self.atn),
         ]
 
         with m.FSM():
@@ -176,6 +183,7 @@ class GPIB(Elaboratable):
                 with m.Else():
                     m.next = "Listen: Begin"
 
+            # Listen!
             with m.State("Listen: Begin"):
                 m.d.sync += [
                     self.bus.ndac_o.eq(0),
@@ -208,17 +216,43 @@ class GPIB(Elaboratable):
                 with m.If(self.bus.dav_i):
                     m.next = "Direction"
 
+            # Talk!
             with m.State("Talk: Begin"):
-                m.next = "Direction"
+                m.d.sync += [
+                    self.bus.dav_o.eq(1),
+                    self.tx_data_rdy.eq(0)
+                ]
+                with m.If(self.tx_data_ack):
+                    m.next = "Talk: Send data"
+
+            with m.State("Talk: Send data"):
+                m.d.sync += [
+                    self.bus.dav_o.eq(1),
+                ]
+                with m.If(~self.bus.ndac_i & self.bus.nrfd_i):
+                    m.d.sync += [
+                        self.bus.dio_o.eq(~self.tx_data),
+                    ]
+                    m.next = "Talk: Await acknowledge"
+
+            with m.State("Talk: Await acknowledge"):
+                with m.If(self.tx_data_ack):
+                    m.d.sync += [
+                        self.tx_data_rdy.eq(1),
+                        self.bus.dav_o.eq(0),
+                    ]
+                with m.If(self.bus.ndac_i):
+                    m.next = "Direction"
 
         return m
 
 class GPIBSubtarget(Elaboratable):
 
-    def __init__(self, ports, in_fifo, eoi, direction):
-        self.ports    = ports
-        self.in_fifo  = in_fifo
-        self.eoi      = eoi
+    def __init__(self, ports, in_fifo, out_fifo, eoi, direction):
+        self.ports     = ports
+        self.in_fifo   = in_fifo
+        self.out_fifo  = out_fifo
+        self.eoi       = eoi
         self.direction = direction
 
         self.gpib = GPIB(ports)
@@ -232,12 +266,20 @@ class GPIBSubtarget(Elaboratable):
             self.in_fifo.w_data.eq(gpib.rx_data),
             self.in_fifo.w_en.eq(gpib.rx_data_rdy),
             gpib.rx_data_ack.eq(self.in_fifo.w_rdy),
+        ]
+
+        m.d.comb += [
+            gpib.tx_data.eq(self.out_fifo.r_data),
+            gpib.tx_data_ack.eq(self.out_fifo.r_rdy),
+            self.out_fifo.r_en.eq(gpib.tx_data_rdy),
+        ]
+
+        m.d.comb += [
             self.eoi.eq(gpib.eoi),
             gpib.direction.eq(self.direction),
         ]
 
         return m
-
 
 class GPIBApplet(GlasgowApplet):
     logger = logging.getLogger(__name__)
@@ -279,6 +321,7 @@ class GPIBApplet(GlasgowApplet):
                 ren  = args.pin_ren,
             ),
             in_fifo=iface.get_in_fifo(),
+            out_fifo=iface.get_out_fifo(),
             eoi=eoi, direction=direction
         ))
 
@@ -289,26 +332,42 @@ class GPIBApplet(GlasgowApplet):
         super().add_run_arguments(parser, access)
 
     async def run(self, device, args):
-        # In the default direction of listen...
-        pull_high = set(args.pin_set_dio).union({
-            args.pin_dav, args.pin_eoi, args.pin_ifc, args.pin_atn, args.pin_ren
+        self.listen_pull_high = default_pull_high = set(args.pin_set_dio).union({
+            args.pin_eoi, args.pin_dav, args.pin_ifc, args.pin_atn, args.pin_ren
         })
-
+        self.talk_pull_high   = {
+            args.pin_nrfd, args.pin_ndac, args.pin_srq, args.pin_ifc, args.pin_atn, args.pin_ren
+        }
         iface = await device.demultiplexer.claim_interface(self, self.mux_interface, args,
-                                                           pull_high=pull_high)
+                                                           pull_high=default_pull_high)
         return iface
 
     @classmethod
     def add_interact_arguments(cls, parser):
         pass
 
-    async def interact(self, device, args, gpib):
+    async def talk(self, device, args, gpib, data):
+        await device.set_pulls(args.port_spec, high={pin.number for pin in self.talk_pull_high})
+        await device.write_register(self.__addr_direction, 1)
+
+    async def listen(self, device, args, gpib):
+        listen_pull_high = set(args.pin_set_dio).union({
+            args.pin_eoi, args.pin_dav, args.pin_ifc, args.pin_atn, args.pin_ren
+        })
+        await device.set_pulls(args.port_spec, high={pin.number for pin in self.listen_pull_high})
         await device.write_register(self.__addr_direction, 0)
-        eoi = True
+        return (await gpib.read()).tobytes().decode('ascii')
+
+    async def interact(self, device, args, gpib):
         while True:
-            read_data = await gpib.read()
-            print(read_data.tobytes().decode('ascii'), end='')
-            eoi = await device.read_register(self.__addr_eoi)
+            print(await self.listen(device, args, gpib), end='')
+
+        # await device.write_register(self.__addr_direction, 0)
+        # eoi = True
+        # while True:
+        #     read_data = await gpib.read()
+        #     print(read_data.tobytes().decode('ascii'), end='')
+        #     eoi = await device.read_register(self.__addr_eoi)
 
     @classmethod
     def tests(cls):
