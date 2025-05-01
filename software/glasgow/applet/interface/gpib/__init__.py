@@ -162,13 +162,10 @@ class GPIBBus(Elaboratable):
         return m
 
 class GPIB(Elaboratable):
-    def __init__(self, ports, out_fifo):
+    def __init__(self, ports, in_fifo, out_fifo):
         self.bus = GPIBBus(ports)
+        self.in_fifo  = in_fifo
         self.out_fifo = out_fifo
-
-        self.rx_data     = Signal(8)
-        self.rx_data_rdy = Signal(1)
-        self.rx_data_ack = Signal(1)
 
         self.direction   = Signal(1) # Talk = HIGH,  Listen = LOW
 
@@ -197,35 +194,69 @@ class GPIB(Elaboratable):
             self.bus.ifc_o.eq(self.ifc_o),
         ]
 
-        with m.FSM():
-            with m.State("Talk: Begin"):
-                m.d.sync += [
-                    self.bus.dav_o.eq(1),
-                    self.bus.ren_o.eq(1),
-                ]
-                with m.If(~self.bus.ndac_i):
-                    m.next = "Talk: Set data lines"
+        latched_direction = Signal()
+        m.d.sync += latched_direction.eq(self.direction)
 
-            with m.State("Talk: Set data lines"):
-                m.d.comb += self.out_fifo.r_en.eq(1)
-                with m.If(self.out_fifo.r_rdy):
-                    m.d.sync += self.bus.dio_o.eq(~self.out_fifo.r_data)
-                    m.d.sync += timer.eq(delay_cycles - 1),
-                    m.next = "Talk: Wait for lines to settle"
+        with m.If(~self.direction):
+            with m.FSM():
+                with m.State("Listen: Begin"):
+                    m.d.sync += [
+                        self.bus.ndac_o.eq(0),
+                        self.bus.nrfd_o.eq(1),
+                    ]
+                    with m.If(~self.bus.dav_i):
+                        m.next = "Listen: Read data lines"
 
-            with m.State("Talk: Wait for lines to settle"):
-                m.d.sync += timer.eq(timer - 1)
-                with m.If(timer == 0):
-                    m.next = "Talk: Wait for NRFD unasserted"
+                with m.State("Listen: Read data lines"):
+                    m.d.sync += [
+                        self.in_fifo.w_data.eq(~self.bus.dio_i),
+                        self.bus.ndac_o.eq(1),
+                    ]
+                    m.d.comb += self.in_fifo.w_en.eq(1)
+                    m.next = "Listen: Wait for acknowledgement"
 
-            with m.State("Talk: Wait for NRFD unasserted"):
-                with m.If(self.bus.nrfd_i):
-                    m.d.sync += self.bus.dav_o.eq(0),
-                    m.next = "Talk: Await NDAC asserted"
+                with m.State("Listen: Wait for acknowledgement"):
+                    with m.If(self.in_fifo.w_rdy):
+                        m.d.sync += [
+                            self.bus.nrfd_o.eq(0),
+                            self.bus.ndac_o.eq(0),
+                        ]
+                        m.next = "Listen: Wait for DAV unasserted"
 
-            with m.State("Talk: Await NDAC asserted"):
-                with m.If(self.bus.ndac_i):
-                    m.next = "Talk: Begin"
+                with m.State("Listen: Wait for DAV unasserted"):
+                    with m.If(self.bus.dav_i):
+                        m.next = "Listen: Begin"
+
+        with m.If(self.direction):
+            with m.FSM():
+                with m.State("Talk: Begin"):
+                    m.d.sync += [
+                        self.bus.dav_o.eq(1),
+                        self.bus.ren_o.eq(1),
+                    ]
+                    with m.If(~self.bus.ndac_i):
+                        m.next = "Talk: Set data lines"
+
+                with m.State("Talk: Set data lines"):
+                    m.d.comb += self.out_fifo.r_en.eq(1)
+                    with m.If(self.out_fifo.r_rdy):
+                        m.d.sync += self.bus.dio_o.eq(~self.out_fifo.r_data)
+                        m.d.sync += timer.eq(delay_cycles - 1),
+                        m.next = "Talk: Wait for lines to settle"
+
+                with m.State("Talk: Wait for lines to settle"):
+                    m.d.sync += timer.eq(timer - 1)
+                    with m.If(timer == 0):
+                        m.next = "Talk: Wait for NRFD unasserted"
+
+                with m.State("Talk: Wait for NRFD unasserted"):
+                    with m.If(self.bus.nrfd_i):
+                        m.d.sync += self.bus.dav_o.eq(0),
+                        m.next = "Talk: Await NDAC asserted"
+
+                with m.State("Talk: Await NDAC asserted"):
+                    with m.If(self.bus.ndac_i):
+                        m.next = "Talk: Begin"
 
 
         return m
@@ -242,14 +273,14 @@ class GPIBSubtarget(Elaboratable):
         self.ifc       = ifc
         self.direction = direction
 
-        self.gpib = GPIB(ports, out_fifo)
+        self.gpib = GPIB(ports, in_fifo, out_fifo)
 
     def elaborate(self, platform):
         m = Module()
 
         m.submodules.gpib = gpib = self.gpib
 
-        m.d.sync += [
+        m.d.comb += [
             self.eoi_i.eq(gpib.eoi_i),
             gpib.eoi_o.eq(self.eoi_o),
             gpib.atn_o.eq(self.atn),
@@ -322,8 +353,7 @@ class GPIBApplet(GlasgowApplet):
             args.pin_nrfd, args.pin_ndac,  args.pin_srq
         })
 
-        iface = await device.demultiplexer.claim_interface(self, self.mux_interface, args,
-                                                           pull_high = self.talk_pull_high)
+        iface = await device.demultiplexer.claim_interface(self, self.mux_interface, args)
         return iface
 
     @classmethod
@@ -400,11 +430,10 @@ class GPIBApplet(GlasgowApplet):
         await self.command(device, args, gpib, b'\n') # \n
         await device.write_register(self.__addr_eoi_o, 1)
 
-        # await device.write_register(self.__addr_atn, 0)
-        # await self.command(device, args, gpib, bytes([0x3f])) # Unlisten
-        # await device.write_register(self.__addr_atn, 1)
+        time.sleep(1)
+
         while True:
-            pass
+            print(await self.listen(device, args, gpib, True))
 
 
     @classmethod
