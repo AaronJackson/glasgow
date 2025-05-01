@@ -97,18 +97,18 @@ class GPIBBus(Elaboratable):
         m.submodules.dav_buffer  = dav_buffer  = io.Buffer("io", self.ports.dav)
         m.submodules.nrfd_buffer = nrfd_buffer = io.Buffer("io", self.ports.nrfd)
         m.submodules.ndac_buffer = ndac_buffer = io.Buffer("io", self.ports.ndac)
-        #m.submodules.srq_buffer  = srq_buffer  = io.Buffer("i", self.ports.srq)
+        m.submodules.srq_buffer  = srq_buffer  = io.Buffer("i", self.ports.srq)
         m.submodules.ifc_buffer  = ifc_buffer  = io.Buffer("o", self.ports.ifc)
         m.submodules.atn_buffer  = atn_buffer  = io.Buffer("o", self.ports.atn)
-        #m.submodules.ren_buffer  = ren_buffer  = io.Buffer("o", self.ports.ren)
+        m.submodules.ren_buffer  = ren_buffer  = io.Buffer("o", self.ports.ren)
 
         # To make the rest of this easier to follow, we can break out
         # the direction into two signals.
         talking   = Signal()
         listening = Signal()
         m.d.comb += [
-            talking.eq(1),
-            listening.eq(0),
+            talking.eq(self.direction),
+            listening.eq(~self.direction),
         ]
 
         m.d.comb += [
@@ -122,22 +122,22 @@ class GPIBBus(Elaboratable):
         # and use that to determine if an output should be enabled.
         # srq is input only, so it does not get an oe signal.
         m.d.sync += [
-            dio_buffer.oe.eq(1),
-            eoi_buffer.oe.eq(1),
-            dav_buffer.oe.eq(1),
-            nrfd_buffer.oe.eq(0),
-            ndac_buffer.oe.eq(0),
-            ifc_buffer.oe.eq(1),
-            atn_buffer.oe.eq(1),
-            #ren_buffer.oe.eq(1),
+            dio_buffer.oe.eq(talking),
+            eoi_buffer.oe.eq(talking),
+            dav_buffer.oe.eq(talking),
+            nrfd_buffer.oe.eq(listening),
+            ndac_buffer.oe.eq(listening),
+            ifc_buffer.oe.eq(talking),
+            atn_buffer.oe.eq(talking),
+            ren_buffer.oe.eq(talking),
         ]
 
         # Some lines never change from the controller's perspective.
         m.d.sync += [
-            #self.srq_i.eq(srq_buffer.i),
+            self.srq_i.eq(srq_buffer.i),
             ifc_buffer.o.eq(self.ifc_o), # register
             atn_buffer.o.eq(self.atn_o), # register
-            #ren_buffer.o.eq(self.ren_o), # register
+            ren_buffer.o.eq(self.ren_o), # register
         ]
 
         # and some do
@@ -192,7 +192,7 @@ class GPIB(Elaboratable):
         m.d.sync += [
             self.eoi_i.eq(self.bus.eoi_i),
             self.bus.eoi_o.eq(self.eoi_o),
-            self.bus.direction.eq(1),
+            self.bus.direction.eq(self.direction),
             self.bus.atn_o.eq(self.atn_o),
             self.bus.ifc_o.eq(self.ifc_o),
         ]
@@ -257,6 +257,7 @@ class GPIBSubtarget(Elaboratable):
             gpib.eoi_o.eq(self.eoi_o),
             gpib.atn_o.eq(self.atn),
             gpib.ifc_o.eq(self.ifc),
+            gpib.direction.eq(self.direction),
         ]
 
         return m
@@ -333,8 +334,8 @@ class GPIBApplet(GlasgowApplet):
         pass
 
     async def talk(self, device, args, gpib, data):
-        # await device.set_pulls(args.port_spec, high={pin.number for pin in self.talk_pull_high})
-        # await device.write_register(self.__addr_direction, 1)
+        await device.set_pulls(args.port_spec, high={pin.number for pin in self.talk_pull_high})
+        await device.write_register(self.__addr_direction, 1)
 
         eoi = await device.read_register(self.__addr_eoi_o)
         if (eoi == 0):
@@ -347,36 +348,29 @@ class GPIBApplet(GlasgowApplet):
         else:
             atn = ""
 
-        # if type(data) is int:
         print(data, eoi, atn)
         await gpib.write(data)
         await gpib.flush()
-        # elif type(data) is bytes:
-        #     for b in data:
-        #         print(b, hex(b), bytes([b]), eoi, atn)
-        #         await gpib.write(bytes([b]))
-        #         await gpib.flush()
-        #         time.sleep(0.1)
 
 
-    # async def listen(self, device, args, gpib, to_eoi=False):
-    #     await device.set_pulls(args.port_spec, high={pin.number for pin in self.listen_pull_high})
-    #     await device.write_register(self.__addr_direction, 0)
+    async def listen(self, device, args, gpib, to_eoi=False):
+        await device.set_pulls(args.port_spec, high={pin.number for pin in self.listen_pull_high})
+        await device.write_register(self.__addr_direction, 0)
 
-    #     if to_eoi:
-    #         eoi = True
-    #         data = (await gpib.read()).tobytes()
-    #         while eoi:
-    #             # This needs to move to asyncio with a yield
-    #             data += (await gpib.read()).tobytes()
-    #             eoi = await device.read_register(self.__addr_eoi_i)
-    #         return data
-    #     else:
-    #         return (await gpib.read()).tobytes()
+        if to_eoi:
+            eoi = True
+            data = (await gpib.read()).tobytes()
+            while eoi:
+                # This needs to move to asyncio with a yield
+                data += (await gpib.read()).tobytes()
+                eoi = await device.read_register(self.__addr_eoi_i)
+            return data
+        else:
+            return (await gpib.read()).tobytes()
 
     async def command(self, device, args, gpib, command):
         await self.talk(device, args, gpib, command)
-        time.sleep(0.1)
+
 
     async def interact(self, device, args, gpib):
         await device.write_register(self.__addr_direction, 1)
