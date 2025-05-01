@@ -121,7 +121,7 @@ class GPIBBus(Elaboratable):
 
         # and use that to determine if an output should be enabled.
         # srq is input only, so it does not get an oe signal.
-        m.d.sync += [
+        m.d.comb += [
             dio_buffer.oe.eq(talking),
             eoi_buffer.oe.eq(talking),
             dav_buffer.oe.eq(talking),
@@ -133,7 +133,7 @@ class GPIBBus(Elaboratable):
         ]
 
         # Some lines never change from the controller's perspective.
-        m.d.sync += [
+        m.d.comb += [
             self.srq_i.eq(srq_buffer.i),
             ifc_buffer.o.eq(self.ifc_o), # register
             atn_buffer.o.eq(self.atn_o), # register
@@ -142,7 +142,7 @@ class GPIBBus(Elaboratable):
 
         # and some do
         with m.If(listening):
-            m.d.sync += [
+            m.d.comb += [
                 self.dio_i.eq(dio_buffer.i),
                 self.eoi_i.eq(eoi_buffer.i),
                 self.dav_i.eq(dav_buffer.i),
@@ -151,7 +151,7 @@ class GPIBBus(Elaboratable):
             ]
 
         with m.If(talking):
-            m.d.sync += [
+            m.d.comb += [
                 dio_buffer.o.eq(self.dio_o),
                 eoi_buffer.o.eq(self.eoi_o),
                 dav_buffer.o.eq(self.dav_o),
@@ -189,14 +189,13 @@ class GPIB(Elaboratable):
         # Direction - Determines whether we are listening or talking.
         #             The state of pull up resistors is handled by interact.
         # ATN       - When active, puts the GPIB into Command mode.
-        m.d.sync += [
+        m.d.comb += [
             self.eoi_i.eq(self.bus.eoi_i),
             self.bus.eoi_o.eq(self.eoi_o),
             self.bus.direction.eq(self.direction),
             self.bus.atn_o.eq(self.atn_o),
             self.bus.ifc_o.eq(self.ifc_o),
         ]
-
 
         with m.FSM():
             with m.State("Talk: Begin"):
@@ -221,9 +220,7 @@ class GPIB(Elaboratable):
 
             with m.State("Talk: Wait for NRFD unasserted"):
                 with m.If(self.bus.nrfd_i):
-                    m.d.sync += [
-                        self.bus.dav_o.eq(0),
-                    ]
+                    m.d.sync += self.bus.dav_o.eq(0),
                     m.next = "Talk: Await NDAC asserted"
 
             with m.State("Talk: Await NDAC asserted"):
