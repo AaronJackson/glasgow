@@ -45,6 +45,11 @@ the bus management lines (x5) and the handshake lines (x3).
   NDAC   - Not Data Accepted
            A device is not ready to receive data yet.
 
+The NRFD and NDAC lines limit the speed that the bus can run - this
+will be determined by the slowest device on the bus. The talker will
+pull these lines high, through a resistor. Each listener will pin them
+to ground until they are ready for the next step.
+
 Whether the ports are inputs or outputs is dictated by whether the device is
 listening or talking.
 
@@ -56,6 +61,11 @@ listening or talking.
 +--------++------+-----+-----+------+------+-----+-----+-----+-----+
 
 All lines use active low signalling. It probably would have made sense to invert the pins.
+
+When a line is marked as an input, it should passively pull up the
+line to 5v. Otherwise, the lines voltage should be dictatd by other
+devices on the bus.
+
 """
 
 class GPIBBus(Elaboratable):
@@ -87,43 +97,52 @@ class GPIBBus(Elaboratable):
         m.submodules.dav_buffer  = dav_buffer  = io.Buffer("io", self.ports.dav)
         m.submodules.nrfd_buffer = nrfd_buffer = io.Buffer("io", self.ports.nrfd)
         m.submodules.ndac_buffer = ndac_buffer = io.Buffer("io", self.ports.ndac)
-        m.submodules.srq_buffer  = srq_buffer  = io.Buffer("i", self.ports.srq)
+        #m.submodules.srq_buffer  = srq_buffer  = io.Buffer("i", self.ports.srq)
         m.submodules.ifc_buffer  = ifc_buffer  = io.Buffer("o", self.ports.ifc)
         m.submodules.atn_buffer  = atn_buffer  = io.Buffer("o", self.ports.atn)
-        m.submodules.ren_buffer  = ren_buffer  = io.Buffer("o", self.ports.ren)
+        #m.submodules.ren_buffer  = ren_buffer  = io.Buffer("o", self.ports.ren)
 
         # To make the rest of this easier to follow, we can break out
         # the direction into two signals.
         talking   = Signal()
         listening = Signal()
-        m.d.sync += [
-            talking.eq(self.direction),
-            listening.eq(~self.direction),
+        m.d.comb += [
+            talking.eq(1),
+            listening.eq(0),
+        ]
+
+        m.d.comb += [
+            platform.request("led", 0).o.eq(~self.eoi_o),
+            platform.request("led", 1).o.eq(~self.dav_o),
+            platform.request("led", 2).o.eq(~self.atn_o),
+            platform.request("led", 3).o.eq(~self.nrfd_i),
+            platform.request("led", 4).o.eq(~self.ndac_i),
         ]
 
         # and use that to determine if an output should be enabled.
         # srq is input only, so it does not get an oe signal.
         m.d.sync += [
-            dio_buffer.oe.eq(talking),
-            eoi_buffer.oe.eq(talking),
-            dav_buffer.oe.eq(talking),
-            nrfd_buffer.oe.eq(listening),
-            ndac_buffer.oe.eq(listening),
+            dio_buffer.oe.eq(1),
+            eoi_buffer.oe.eq(1),
+            dav_buffer.oe.eq(1),
+            nrfd_buffer.oe.eq(0),
+            ndac_buffer.oe.eq(0),
             ifc_buffer.oe.eq(1),
             atn_buffer.oe.eq(1),
-            ren_buffer.oe.eq(1),
+            #ren_buffer.oe.eq(1),
         ]
 
         # Some lines never change from the controller's perspective.
         m.d.sync += [
-            self.srq_i.eq(srq_buffer.i),
-            ifc_buffer.o.eq(self.ifc_o),
-            atn_buffer.o.eq(self.atn_o),
-            ren_buffer.o.eq(self.ren_o),
+            #self.srq_i.eq(srq_buffer.i),
+            ifc_buffer.o.eq(self.ifc_o), # register
+            atn_buffer.o.eq(self.atn_o), # register
+            #ren_buffer.o.eq(self.ren_o), # register
         ]
 
+        # and some do
         with m.If(listening):
-            m.d.comb += [
+            m.d.sync += [
                 self.dio_i.eq(dio_buffer.i),
                 self.eoi_i.eq(eoi_buffer.i),
                 self.dav_i.eq(dav_buffer.i),
@@ -132,7 +151,7 @@ class GPIBBus(Elaboratable):
             ]
 
         with m.If(talking):
-            m.d.comb += [
+            m.d.sync += [
                 dio_buffer.o.eq(self.dio_o),
                 eoi_buffer.o.eq(self.eoi_o),
                 dav_buffer.o.eq(self.dav_o),
@@ -151,10 +170,6 @@ class GPIB(Elaboratable):
         self.rx_data_rdy = Signal(1)
         self.rx_data_ack = Signal(1)
 
-        self.tx_data     = Signal(8)
-        self.tx_data_rdy = Signal(1)
-        self.tx_data_ack = Signal(1)
-
         self.direction   = Signal(1) # Talk = HIGH,  Listen = LOW
 
         self.eoi_i       = Signal(1)
@@ -166,8 +181,7 @@ class GPIB(Elaboratable):
         m = Module()
 
         m.submodules.bus = self.bus
-        delay_cycles = math.ceil(150)
-        print(delay_cycles)
+        delay_cycles = math.ceil(300)
         timer = Signal(range(delay_cycles + 1))
 
         # Some signals need to be accessible as registers.
@@ -178,61 +192,18 @@ class GPIB(Elaboratable):
         m.d.sync += [
             self.eoi_i.eq(self.bus.eoi_i),
             self.bus.eoi_o.eq(self.eoi_o),
-            self.bus.direction.eq(self.direction),
+            self.bus.direction.eq(1),
             self.bus.atn_o.eq(self.atn_o),
+            self.bus.ifc_o.eq(self.ifc_o),
         ]
 
+
         with m.FSM():
-            # Determine whether we're in talk or listen mode
-            with m.State("Direction"):
-                with m.If(self.direction):
-                    m.next = "Talk: Begin"
-                with m.Else():
-                    m.next = "Listen: Begin"
-
-            # Listen!
-            with m.State("Listen: Begin"):
-                m.d.sync += [
-                    self.bus.ndac_o.eq(0),
-                    self.bus.nrfd_o.eq(1),
-                    self.bus.ifc_o.eq(1),
-                    self.bus.atn_o.eq(1),
-                    self.bus.ren_o.eq(1),
-                ]
-                with m.If(~self.bus.dav_i):
-                    m.next = "Listen: Read data"
-
-            with m.State("Listen: Read data"):
-                m.d.sync += [
-                    self.rx_data.eq(~self.bus.dio_i),
-                    self.bus.ndac_o.eq(1),
-                    self.rx_data_rdy.eq(1),
-                ]
-                m.next = "Listen: Wait for acknowledgement"
-
-            with m.State("Listen: Wait for acknowledgement"):
-                with m.If(self.rx_data_ack):
-                    m.d.sync += [
-                        self.rx_data_rdy.eq(0),
-                        self.bus.nrfd_o.eq(0),
-                        self.bus.ndac_o.eq(0),
-                    ]
-                    m.next = "Listen: Wait for DAV Unasserted"
-
-            with m.State("Listen: Wait for DAV Unasserted"):
-                with m.If(self.bus.dav_i):
-                    m.next = "Direction"
-
-            # Talk! (via out_fifo)
             with m.State("Talk: Begin"):
                 m.d.sync += [
                     self.bus.dav_o.eq(1),
-                    self.bus.ifc_o.eq(1),
                     self.bus.ren_o.eq(1),
                 ]
-                m.next = "Talk: Wait for NDAC low"
-
-            with m.State("Talk: Wait for NDAC low"):
                 with m.If(~self.bus.ndac_i):
                     m.next = "Talk: Set data lines"
 
@@ -240,28 +211,25 @@ class GPIB(Elaboratable):
                 m.d.comb += self.out_fifo.r_en.eq(1)
                 with m.If(self.out_fifo.r_rdy):
                     m.d.sync += self.bus.dio_o.eq(~self.out_fifo.r_data)
-                    m.d.sync += timer.eq(delay_cycles)
+                    m.d.sync += timer.eq(delay_cycles - 1),
                     m.next = "Talk: Wait for lines to settle"
 
             with m.State("Talk: Wait for lines to settle"):
                 m.d.sync += timer.eq(timer - 1)
                 with m.If(timer == 0):
-                    m.next = "Talk: Wait for NRFD high"
+                    m.next = "Talk: Wait for NRFD unasserted"
 
-            with m.State("Talk: Wait for NRFD high"):
+            with m.State("Talk: Wait for NRFD unasserted"):
                 with m.If(self.bus.nrfd_i):
-                    m.next = "Talk: Assert DAV"
+                    m.d.sync += [
+                        self.bus.dav_o.eq(0),
+                    ]
+                    m.next = "Talk: Await NDAC asserted"
 
-            with m.State("Talk: Assert DAV"):
-                m.d.sync += self.bus.dav_o.eq(0)
-                m.next = "Talk: Await GPIB Acknowledgement"
+            with m.State("Talk: Await NDAC asserted"):
+                with m.If(self.bus.ndac_i):
+                    m.next = "Talk: Begin"
 
-            with m.State("Talk: Await GPIB Acknowledgement"):
-                with m.If(~self.bus.nrfd_i & self.bus.ndac_i):
-                    m.next = "Talk: Await FIFO Acknowledgement"
-
-            with m.State("Talk: Await FIFO Acknowledgement"):
-                m.next = "Talk: Begin"
 
         return m
 
@@ -285,15 +253,8 @@ class GPIBSubtarget(Elaboratable):
         m.submodules.gpib = gpib = self.gpib
 
         m.d.sync += [
-            self.in_fifo.w_data.eq(gpib.rx_data),
-            self.in_fifo.w_en.eq(gpib.rx_data_rdy),
-            gpib.rx_data_ack.eq(self.in_fifo.w_rdy),
-        ]
-
-        m.d.sync += [
             self.eoi_i.eq(gpib.eoi_i),
             gpib.eoi_o.eq(self.eoi_o),
-            gpib.direction.eq(self.direction),
             gpib.atn_o.eq(self.atn),
             gpib.ifc_o.eq(self.ifc),
         ]
@@ -312,14 +273,14 @@ class GPIBApplet(GlasgowApplet):
     def add_build_arguments(cls, parser, access):
         super().add_build_arguments(parser, access)
 
-        access.add_pin_set_argument(parser, "dio", width=range(1, 8), default=(0,1,2,3,15,14,13,12))
+        access.add_pin_set_argument(parser, "dio", width=range(0, 8), default=(0,1,2,3,15,14,13,12))
         access.add_pin_argument(parser, "eoi",  default=4)
         access.add_pin_argument(parser, "dav",  default=5)
         access.add_pin_argument(parser, "nrfd", default=6)
         access.add_pin_argument(parser, "ndac", default=7)
-        access.add_pin_argument(parser, "srq",  default=9)
-        access.add_pin_argument(parser, "ifc",  default=10)
-        access.add_pin_argument(parser, "atn",  default=8)
+        access.add_pin_argument(parser, "srq",  default=9)  #
+        access.add_pin_argument(parser, "ifc",  default=10) #
+        access.add_pin_argument(parser, "atn",  default=8)  #
         access.add_pin_argument(parser, "ren",  default=11)
 
     def build(self, target, args):
@@ -360,10 +321,11 @@ class GPIBApplet(GlasgowApplet):
             args.pin_eoi, args.pin_dav, args.pin_ifc, args.pin_atn, args.pin_ren
         })
         self.talk_pull_high   = set().union({
-            args.pin_nrfd, args.pin_ndac, #args.pin_srq
+            args.pin_nrfd, args.pin_ndac,  args.pin_srq
         })
 
-        iface = await device.demultiplexer.claim_interface(self, self.mux_interface, args)
+        iface = await device.demultiplexer.claim_interface(self, self.mux_interface, args,
+                                                           pull_high = self.talk_pull_high)
         return iface
 
     @classmethod
@@ -371,88 +333,88 @@ class GPIBApplet(GlasgowApplet):
         pass
 
     async def talk(self, device, args, gpib, data):
-        await device.write_register(self.__addr_direction, 1)
-        await device.set_pulls(args.port_spec, high={pin.number for pin in self.talk_pull_high})
-        time.sleep(0.1)
+        # await device.set_pulls(args.port_spec, high={pin.number for pin in self.talk_pull_high})
+        # await device.write_register(self.__addr_direction, 1)
 
-        if isinstance(data, str):
-            for char in data:
-                print(char, hex(ord(char)))
-                await gpib.write([ord(char)])
-                await gpib.flush()
-        if isinstance(data, int):
-            print(data, hex(data))
-            await gpib.write([data])
-            await gpib.flush()
-
-    async def listen(self, device, args, gpib, to_eoi=False):
-        await device.set_pulls(args.port_spec, high={pin.number for pin in self.listen_pull_high})
-        await device.write_register(self.__addr_direction, 0)
-        time.sleep(0.1)
-
-        if to_eoi:
-            eoi = True
-            data = (await gpib.read()).tobytes()
-            while eoi:
-                # This needs to move to asyncio with a yield
-                data += (await gpib.read()).tobytes()
-                eoi = await device.read_register(self.__addr_eoi_i)
-            return data
+        eoi = await device.read_register(self.__addr_eoi_o)
+        if (eoi == 0):
+            eoi = "EOI"
         else:
-            return (await gpib.read()).tobytes()
+            eoi = ""
+        atn = await device.read_register(self.__addr_atn)
+        if (atn == 0):
+            atn = "ATN"
+        else:
+            atn = ""
+
+        # if type(data) is int:
+        print(data, eoi, atn)
+        await gpib.write(data)
+        await gpib.flush()
+        # elif type(data) is bytes:
+        #     for b in data:
+        #         print(b, hex(b), bytes([b]), eoi, atn)
+        #         await gpib.write(bytes([b]))
+        #         await gpib.flush()
+        #         time.sleep(0.1)
+
+
+    # async def listen(self, device, args, gpib, to_eoi=False):
+    #     await device.set_pulls(args.port_spec, high={pin.number for pin in self.listen_pull_high})
+    #     await device.write_register(self.__addr_direction, 0)
+
+    #     if to_eoi:
+    #         eoi = True
+    #         data = (await gpib.read()).tobytes()
+    #         while eoi:
+    #             # This needs to move to asyncio with a yield
+    #             data += (await gpib.read()).tobytes()
+    #             eoi = await device.read_register(self.__addr_eoi_i)
+    #         return data
+    #     else:
+    #         return (await gpib.read()).tobytes()
 
     async def command(self, device, args, gpib, command):
         await self.talk(device, args, gpib, command)
+        time.sleep(0.1)
 
     async def interact(self, device, args, gpib):
-
+        await device.write_register(self.__addr_direction, 1)
         await device.write_register(self.__addr_eoi_o, 1)
         await device.write_register(self.__addr_atn, 1)
         await device.write_register(self.__addr_ifc, 1)
 
-        # Interface Clear
+        # # Interface Clear
         # await device.write_register(self.__addr_ifc, 0)
         # time.sleep(0.5)
         # await device.write_register(self.__addr_ifc, 1)
+        # time.sleep(0.5)
 
+        # Specify talk and listen addresses
         await device.write_register(self.__addr_atn, 0)
-        time.sleep(0.1)
-        await self.command(device, args, gpib, 63) # UNLISTEN
-        await self.command(device, args, gpib, 95) # UNTALK
-        await self.command(device, args, gpib, 64 + 10) # TALK 10
-        await self.command(device, args, gpib, 32 + 10)  # LISTEN 5
-        time.sleep(0.1)
+        # await self.command(device, args, gpib, 31) # UNTALK
+        # await self.command(device, args, gpib, 95) # UNTALK
+        await self.command(device, args, gpib, bytes([0x40 + 5]))  # My Listen Address
+        await self.command(device, args, gpib, bytes([0x20 + 10]))  # My Talk Address
         await device.write_register(self.__addr_atn, 1)
 
-        # time.sleep(0.1)
-
-        # await self.talk(device, args, gpib, "*IDN?")
-        await self.talk(device, args, gpib, "HARDC STAR")
-        # await self.talk(device, args, gpib, 42)
-        # await self.talk(device, args, gpib, 73)
-        # await self.talk(device, args, gpib, 68)
-        # await self.talk(device, args, gpib, 78)
-        # await self.talk(device, args, gpib, 63)
+        # await self.talk(device, args, gpib, b"*IDN?")
+        # await self.talk(device, args, gpib, b"HARDC STAR")
+        await self.command(device, args, gpib, b'*') # *
+        await self.command(device, args, gpib, b'I') # I
+        await self.command(device, args, gpib, b'D') # D
+        await self.command(device, args, gpib, b'N') # N
+        await self.command(device, args, gpib, b'?') # ?
         await device.write_register(self.__addr_eoi_o, 0)
-        await self.talk(device, args, gpib, 13) # send carriage return
+        await self.command(device, args, gpib, b'\n') # \n
         await device.write_register(self.__addr_eoi_o, 1)
 
-        time.sleep(2)
-
         # await device.write_register(self.__addr_atn, 0)
-        # await self.command(device, args, gpib, 63)
-        # await self.command(device, args, gpib, 32 + 10) # TALK 10
+        # await self.command(device, args, gpib, bytes([0x3f])) # Unlisten
         # await device.write_register(self.__addr_atn, 1)
-
         while True:
-            print((await self.listen(device, args, gpib, to_eoi=True)), end='')
+            pass
 
-
-        # eoi = True
-        # while True:
-        #     read_data = await gpib.read()
-        #     print(read_data.tobytes().decode('ascii'), end='')
-        #     eoi = await device.read_register(self.__addr_eoi)
 
     @classmethod
     def tests(cls):
