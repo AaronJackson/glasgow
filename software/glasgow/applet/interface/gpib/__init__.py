@@ -111,14 +111,6 @@ class GPIBBus(Elaboratable):
             listening.eq(~self.direction),
         ]
 
-        m.d.comb += [
-            platform.request("led", 0).o.eq(~self.eoi_o),
-            platform.request("led", 1).o.eq(~self.dav_o),
-            platform.request("led", 2).o.eq(~self.atn_o),
-            platform.request("led", 3).o.eq(~self.nrfd_i),
-            platform.request("led", 4).o.eq(~self.ndac_i),
-        ]
-
         # and use that to determine if an output should be enabled.
         # srq is input only, so it does not get an oe signal.
         m.d.comb += [
@@ -194,8 +186,14 @@ class GPIB(Elaboratable):
             self.bus.ifc_o.eq(self.ifc_o),
         ]
 
-        latched_direction = Signal()
-        m.d.sync += latched_direction.eq(self.direction)
+        stuck = Signal()
+        m.d.comb += [
+            platform.request("led", 0).o.eq(self.direction),
+            platform.request("led", 1).o.eq(0),
+            platform.request("led", 2).o.eq(stuck),
+            platform.request("led", 3).o.eq(0),
+            platform.request("led", 4).o.eq(~self.direction),
+        ]
 
         with m.If(~self.direction):
             with m.FSM():
@@ -203,28 +201,26 @@ class GPIB(Elaboratable):
                     m.d.sync += [
                         self.bus.ndac_o.eq(0),
                         self.bus.nrfd_o.eq(1),
+                        stuck.eq(0),
                     ]
                     with m.If(~self.bus.dav_i):
                         m.next = "Listen: Read data lines"
 
                 with m.State("Listen: Read data lines"):
+                    m.d.comb += self.in_fifo.w_en.eq(1)
                     m.d.sync += [
                         self.in_fifo.w_data.eq(~self.bus.dio_i),
-                        self.bus.ndac_o.eq(1),
+                        self.bus.nrfd_o.eq(0),
                     ]
-                    m.d.comb += self.in_fifo.w_en.eq(1)
-                    m.next = "Listen: Wait for acknowledgement"
-
-                with m.State("Listen: Wait for acknowledgement"):
                     with m.If(self.in_fifo.w_rdy):
                         m.d.sync += [
-                            self.bus.nrfd_o.eq(0),
-                            self.bus.ndac_o.eq(0),
+                            self.bus.ndac_o.eq(1),
                         ]
                         m.next = "Listen: Wait for DAV unasserted"
 
                 with m.State("Listen: Wait for DAV unasserted"):
                     with m.If(self.bus.dav_i):
+                        m.d.sync += self.bus.ndac_o.eq(0),
                         m.next = "Listen: Begin"
 
         with m.If(self.direction):
@@ -347,7 +343,7 @@ class GPIBApplet(GlasgowApplet):
     async def run(self, device, args):
 
         self.listen_pull_high = default_pull_high = set(args.pin_set_dio).union({
-            args.pin_eoi, args.pin_dav, args.pin_ifc, args.pin_atn, args.pin_ren
+            args.pin_eoi, args.pin_dav
         })
         self.talk_pull_high   = set().union({
             args.pin_nrfd, args.pin_ndac,  args.pin_srq
@@ -427,13 +423,12 @@ class GPIBApplet(GlasgowApplet):
         await self.command(device, args, gpib, b'N') # N
         await self.command(device, args, gpib, b'?') # ?
         await device.write_register(self.__addr_eoi_o, 0)
-        await self.command(device, args, gpib, b'\n') # \n
+        await self.command(device, args, gpib, b'\n') # \r
         await device.write_register(self.__addr_eoi_o, 1)
 
         time.sleep(1)
-
         while True:
-            print(await self.listen(device, args, gpib, True))
+            print(await self.listen(device, args, gpib, False))
 
 
     @classmethod
