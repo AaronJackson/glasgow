@@ -2,6 +2,7 @@ import logging
 import argparse
 import math
 import time
+import sys
 from amaranth import *
 from amaranth.lib import io
 from amaranth.lib.cdc import FFSynchronizer
@@ -190,7 +191,7 @@ class GPIB(Elaboratable):
         m.d.comb += [
             platform.request("led", 0).o.eq(self.direction),
             platform.request("led", 1).o.eq(0),
-            platform.request("led", 2).o.eq(stuck),
+            platform.request("led", 2).o.eq(0),
             platform.request("led", 3).o.eq(0),
             platform.request("led", 4).o.eq(~self.direction),
         ]
@@ -254,7 +255,6 @@ class GPIB(Elaboratable):
                     with m.If(self.bus.ndac_i):
                         m.next = "Talk: Begin"
 
-
         return m
 
 class GPIBSubtarget(Elaboratable):
@@ -288,9 +288,9 @@ class GPIBSubtarget(Elaboratable):
 
 class GPIBApplet(GlasgowApplet):
     logger = logging.getLogger(__name__)
-    help = "receive data from gpib"
+    help = "talk to a gpib device"
     description = """
-    Receive 'talk only' data from equipment, not bidirectional.
+    Talk to a GPIB device
     """
     required_revision = "C0"
 
@@ -341,7 +341,6 @@ class GPIBApplet(GlasgowApplet):
 
 
     async def run(self, device, args):
-
         self.listen_pull_high = default_pull_high = set(args.pin_set_dio).union({
             args.pin_eoi, args.pin_dav
         })
@@ -360,18 +359,6 @@ class GPIBApplet(GlasgowApplet):
         await device.set_pulls(args.port_spec, high={pin.number for pin in self.talk_pull_high})
         await device.write_register(self.__addr_direction, 1)
 
-        eoi = await device.read_register(self.__addr_eoi_o)
-        if (eoi == 0):
-            eoi = "EOI"
-        else:
-            eoi = ""
-        atn = await device.read_register(self.__addr_atn)
-        if (atn == 0):
-            atn = "ATN"
-        else:
-            atn = ""
-
-        print(data, eoi, atn)
         await gpib.write(data)
         await gpib.flush()
 
@@ -392,7 +379,9 @@ class GPIBApplet(GlasgowApplet):
             return (await gpib.read()).tobytes()
 
     async def command(self, device, args, gpib, command):
+        await device.write_register(self.__addr_atn, 0)
         await self.talk(device, args, gpib, command)
+        await device.write_register(self.__addr_atn, 1)
 
 
     async def interact(self, device, args, gpib):
@@ -401,37 +390,19 @@ class GPIBApplet(GlasgowApplet):
         await device.write_register(self.__addr_atn, 1)
         await device.write_register(self.__addr_ifc, 1)
 
-        # # Interface Clear
-        # await device.write_register(self.__addr_ifc, 0)
-        # time.sleep(0.5)
-        # await device.write_register(self.__addr_ifc, 1)
-        # time.sleep(0.5)
-
-        # Specify talk and listen addresses
-        await device.write_register(self.__addr_atn, 0)
-        # await self.command(device, args, gpib, 31) # UNTALK
-        # await self.command(device, args, gpib, 95) # UNTALK
-        await self.command(device, args, gpib, bytes([0x40 + 5]))  # My Listen Address
+        await self.command(device, args, gpib, bytes([0x40 + 10]))  # My Listen Address
         await self.command(device, args, gpib, bytes([0x20 + 10]))  # My Talk Address
-        await device.write_register(self.__addr_atn, 1)
 
-        # await self.talk(device, args, gpib, b"*IDN?")
+        await self.talk(device, args, gpib, b"*IDN?")
         # await self.talk(device, args, gpib, b"HARDC STAR")
-        await self.command(device, args, gpib, b'*') # *
-        await self.command(device, args, gpib, b'I') # I
-        await self.command(device, args, gpib, b'D') # D
-        await self.command(device, args, gpib, b'N') # N
-        await self.command(device, args, gpib, b'?') # ?
         await device.write_register(self.__addr_eoi_o, 0)
-        await self.command(device, args, gpib, b'\n') # \r
+        await self.talk(device, args, gpib, b'\n') # \r
         await device.write_register(self.__addr_eoi_o, 1)
 
-        await device.write_register(self.__addr_atn, 0)
         await self.command(device, args, gpib, bytes([0x40 + 10]))  # My Listen Address
-        await device.write_register(self.__addr_atn, 1)
 
         while True:
-            print(await self.listen(device, args, gpib, False))
+            sys.stdout.write((await self.listen(device, args, gpib, True)).decode('ascii'))
 
 
     @classmethod
