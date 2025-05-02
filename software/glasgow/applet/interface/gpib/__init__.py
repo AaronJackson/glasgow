@@ -426,7 +426,10 @@ class GPIBApplet(GlasgowApplet):
         await self.command(device, args, gpib, b'\n') # \r
         await device.write_register(self.__addr_eoi_o, 1)
 
-        time.sleep(1)
+        await device.write_register(self.__addr_atn, 0)
+        await self.command(device, args, gpib, bytes([0x40 + 10]))  # My Listen Address
+        await device.write_register(self.__addr_atn, 1)
+
         while True:
             print(await self.listen(device, args, gpib, False))
 
